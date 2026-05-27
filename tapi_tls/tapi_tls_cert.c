@@ -62,6 +62,35 @@ cert_x509(tapi_job_factory_t *factory, const char *path,
     return 0;
 }
 
+/**
+ * The common name of a subject line.
+ *
+ * Two spellings, because OpenSSL has both: `openssl x509 -subject`
+ * printed @c "subject=CN=host" up to 1.1.1 and prints
+ * @c "subject=CN = host" from 3.0 on. Asking only for the first and
+ * getting nothing is not a certificate without a common name, it is a
+ * parser reading the wrong version's output - and it comes back as a
+ * name mismatch on a certificate that matches perfectly.
+ */
+static char *
+cert_common_name(const char *subject)
+{
+    static const char *const spellings[] = { "CN=", "CN =" };
+    size_t i;
+
+    for (i = 0; i < TE_ARRAY_LEN(spellings); i++)
+    {
+        char *common = tapi_tls_field(subject, spellings[i], ",/\n");
+
+        if (common != NULL && *common != '\0')
+            return common;
+
+        free(common);
+    }
+
+    return NULL;
+}
+
 /** Take the names out of the text form of a certificate. */
 static void
 cert_collect_names(const char *text, tapi_tls_cert *cert)
@@ -73,42 +102,46 @@ cert_collect_names(const char *text, tapi_tls_cert *cert)
     /* The common name, which is still what some clients look at. */
     if (cert->subject != NULL)
     {
-        common = tapi_tls_field(cert->subject, "CN=", ",\n");
-        if (common != NULL && *common != '\0')
+        common = cert_common_name(cert->subject);
+        if (common != NULL)
             TE_VEC_APPEND(&names, common);
-        else
-            free(common);
     }
 
+    /*
+     * The alternative names, which are what everything else looks at.
+     * They sit on the line below the extension's own, indented and
+     * comma separated:
+     *
+     *     X509v3 Subject Alternative Name:
+     *         DNS:dut.example.net, DNS:www.dut.example.net
+     */
     san = strstr(text, "X509v3 Subject Alternative Name:");
     if (san != NULL)
     {
-        const char *line = strchr(san, '\n');
+        const char *values = strchr(san, '\n');
+        const char *end;
+        const char *entry;
 
-        /* The names are on the line below, comma separated. */
-        while (line != NULL)
+        if (values != NULL)
         {
-            const char *entry = strstr(line, "DNS:");
+            values++;
+            end = strchr(values, '\n');
+            if (end == NULL)
+                end = values + strlen(values);
 
-            if (entry == NULL)
-                break;
-
-            while (entry != NULL)
+            for (entry = strstr(values, "DNS:");
+                 entry != NULL && entry < end;
+                 entry = strstr(entry, "DNS:"))
             {
+                size_t len;
                 char *name;
-                const char *next_line = strchr(line, '\n');
-
-                if (next_line != NULL && entry > next_line)
-                    break;
 
                 entry += strlen("DNS:");
-                name = TE_ALLOC(strcspn(entry, ",\n ") + 1);
-                memcpy(name, entry, strcspn(entry, ",\n "));
+                len = strcspn(entry, ",\n ");
+                name = TE_ALLOC(len + 1);
+                memcpy(name, entry, len);
                 TE_VEC_APPEND(&names, name);
-
-                entry = strstr(entry, "DNS:");
             }
-            break;
         }
     }
 
