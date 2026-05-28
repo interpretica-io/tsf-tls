@@ -38,6 +38,9 @@
  */
 #define TLS_SERVER_SETTLE_MS 3000
 
+/** How long the server is given to start listening, ms. */
+#define TLS_SERVER_READY_MS 10000
+
 /** A moment safely in the past, for an expired certificate. */
 #define TLS_SERVER_EXPIRED_AT   "20200101000000Z"
 
@@ -402,6 +405,22 @@ tapi_tls_server_start(tapi_job_factory_t *factory,
     rc = tapi_tls_spawn(factory, "s_server",
                         opt->openssl != NULL ? opt->openssl : "openssl",
                         &args, &result->run);
+    if (rc == 0)
+    {
+        /*
+         * Wait until it is actually listening. s_server prints ACCEPT
+         * when the socket is bound, and it does so a few milliseconds
+         * after the process exists - measured, the client of the very
+         * next line got ECONNREFUSED five milliseconds before ACCEPT
+         * appeared, and every test of what a client does reported that
+         * the client never arrived.
+         */
+        rc = tapi_devtool_run_expect(&result->run, "ACCEPT",
+                                     TLS_SERVER_READY_MS);
+        if (rc != 0)
+            ERROR("The server never started listening on port %u",
+                  opt->port);
+    }
 
 fail:
     te_vec_deep_free(&args);
