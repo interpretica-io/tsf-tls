@@ -59,6 +59,8 @@ struct tapi_tls_server {
     char *ca_file;
     /** Files to remove when the server goes away. */
     te_vec scratch;
+    /** How many connections it was asked to serve; @c 0 means all. */
+    unsigned int naccept;
 };
 
 /* See description in tapi_tls_server.h */
@@ -356,6 +358,7 @@ tapi_tls_server_start(tapi_job_factory_t *factory,
     result = TE_ALLOC(sizeof(*result));
     result->run = (tapi_devtool_run)TAPI_DEVTOOL_RUN_INIT;
     result->ta = TE_STRDUP(ta);
+    result->naccept = opt->naccept;
     result->scratch = (te_vec)TE_VEC_INIT(char *);
 
     if (opt->cert_file != NULL && opt->key_file != NULL)
@@ -510,6 +513,19 @@ tapi_tls_server_stop(tapi_tls_server *server,
         *behaviour = TAPI_TLS_CLIENT_COMPLETED;
     else if (tls_server_stat(text.ptr, "server accepts (SSL_accept())") > 0)
         *behaviour = TAPI_TLS_CLIENT_REJECTED;
+    else if (server->naccept == 0)
+    {
+        /*
+         * Said rather than silently reported as NONE, because the two
+         * are indistinguishable from here and only one of them is a
+         * result about the client. A server told to keep listening is
+         * never asked to leave politely, so it never prints the
+         * statistics, so it can only ever answer "nobody came".
+         */
+        WARN("The server was started with naccept=0, so it cannot say "
+             "what the client did. Set tapi_tls_server_opt::naccept to "
+             "the number of connections the client will make.");
+    }
 
     if (*behaviour == TAPI_TLS_CLIENT_REJECTED)
     {
