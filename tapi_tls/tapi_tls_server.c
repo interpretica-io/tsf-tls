@@ -28,6 +28,16 @@
 /** How long the certificates are valid for, days. */
 #define TLS_SERVER_DAYS     365
 
+/**
+ * How long the server is given to notice it is finished, ms.
+ *
+ * With -naccept it exits by itself after the last connection, but the
+ * test asks the moment its client is done and the two races. A short
+ * wait costs nothing when the server has already gone and saves the
+ * statistics when it has not quite.
+ */
+#define TLS_SERVER_SETTLE_MS 3000
+
 /** A moment safely in the past, for an expired certificate. */
 #define TLS_SERVER_EXPIRED_AT   "20200101000000Z"
 
@@ -37,6 +47,7 @@ const tapi_tls_server_opt tapi_tls_server_default_opt = {
     .common_name = NULL,
     .wrong_name  = NULL,
     .www         = true,
+    .naccept     = 1,
 };
 
 struct tapi_tls_server {
@@ -379,6 +390,11 @@ tapi_tls_server_start(tapi_job_factory_t *factory,
     tapi_tls_arg(&args, "%s", key_file.ptr);
     if (opt->www)
         tapi_tls_arg(&args, "-www");
+    if (opt->naccept != 0)
+    {
+        tapi_tls_arg(&args, "-naccept");
+        tapi_tls_arg(&args, "%u", opt->naccept);
+    }
 
     rc = tapi_tls_spawn(factory, "s_server",
                         opt->openssl != NULL ? opt->openssl : "openssl",
@@ -408,6 +424,39 @@ tapi_tls_server_ca_file(const tapi_tls_server *server)
     return server->ca_file;
 }
 
+/**
+ * Read one of the counters out of s_server's closing statistics.
+ *
+ * The lines are "   1 server accepts (SSL_accept())": the count comes
+ * first, so the search is for the label and the number is read
+ * backwards from it. Returns 0 when the label is not there at all,
+ * which is the same answer as a count of zero and wants no special
+ * case - a server that printed no statistics saw no connection it can
+ * tell us about either way.
+ */
+static unsigned int
+tls_server_stat(const char *text, const char *label)
+{
+    const char *found = strstr(text, label);
+    const char *digits;
+
+    if (found == NULL)
+        return 0;
+
+    /* Back over the space, then over the number. */
+    while (found > text && (found[-1] == ' ' || found[-1] == '\t'))
+        found--;
+
+    digits = found;
+    while (digits > text && digits[-1] >= '0' && digits[-1] <= '9')
+        digits--;
+
+    if (digits == found)
+        return 0;
+
+    return (unsigned int)strtoul(digits, NULL, 10);
+}
+
 /* See description in tapi_tls_server.h */
 te_errno
 tapi_tls_server_stop(tapi_tls_server *server,
@@ -422,29 +471,55 @@ tapi_tls_server_stop(tapi_tls_server *server,
     if (server == NULL)
         return 0;
 
-    rc = tapi_devtool_run_stop(&server->run);
-    if (rc == 0)
-        rc = tapi_devtool_run_wait(&server->run,
-                                   TAPI_DEVTOOL_TERM_TIMEOUT_MS * 5);
+    /*
+     * Waited for first, and only then stopped. With -naccept the
+     * server leaves of its own accord once it has served its
+     * connections, and on the way out it prints the statistics this
+     * whole function reads. Killing it first would take those with it
+     * and every client would look like a client that never arrived -
+     * which is exactly what happened before this was written.
+     */
+    rc = tapi_devtool_run_wait(&server->run, TLS_SERVER_SETTLE_MS);
+    if (TE_RC_GET_ERROR(rc) == TE_EINPROGRESS)
+    {
+        rc = tapi_devtool_run_stop(&server->run);
+        if (rc == 0)
+            rc = tapi_devtool_run_wait(&server->run,
+                                       TAPI_DEVTOOL_TERM_TIMEOUT_MS * 5);
+    }
 
     tapi_devtool_run_get_output(&server->run, &output);
-    te_string_append(&text, "%s%s", output.out, output.err);
+    te_string_append(&text, "%s%s",
+                     output.out != NULL ? output.out : "",
+                     output.err != NULL ? output.err : "");
 
     /*
-     * s_server prints the session parameters once a handshake is
-     * finished, and an alert when the peer refuses the certificate.
-     * Which of the two appeared is the whole answer.
+     * The statistics, which are printed once and say everything:
+     *
+     *     1 server accepts (SSL_accept())
+     *     1 server accepts that finished
+     *
+     * A connection that was made and finished is a client that took
+     * the certificate. One that was made and did not finish is a
+     * client that refused it - and the alert it sent is in the text
+     * as well, which is what the log wants. None at all, or no
+     * statistics because the server was still listening, is a client
+     * that never arrived, and that is not a result about the client.
      */
-    if (strstr(text.ptr, "SSL SESSION PARAMETERS") != NULL ||
-        strstr(text.ptr, "CIPHER is ") != NULL)
-    {
+    if (tls_server_stat(text.ptr, "server accepts that finished") > 0)
         *behaviour = TAPI_TLS_CLIENT_COMPLETED;
-    }
-    else if (strstr(text.ptr, "alert") != NULL ||
-             strstr(text.ptr, "SSL routines") != NULL ||
-             strstr(text.ptr, "no shared cipher") != NULL)
-    {
+    else if (tls_server_stat(text.ptr, "server accepts (SSL_accept())") > 0)
         *behaviour = TAPI_TLS_CLIENT_REJECTED;
+
+    if (*behaviour == TAPI_TLS_CLIENT_REJECTED)
+    {
+        const char *alert = strstr(text.ptr, "alert");
+
+        if (alert != NULL)
+        {
+            RING("The client refused the certificate: %.*s",
+                 (int)strcspn(alert, "\n"), alert);
+        }
     }
 
     te_string_free(&text);

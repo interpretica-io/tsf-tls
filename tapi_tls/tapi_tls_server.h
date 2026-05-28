@@ -100,6 +100,27 @@ typedef struct tapi_tls_server_opt {
     const char *key_file;
     /** Serve a page, so that a client that checks nothing gets an answer. */
     bool www;
+    /**
+     * Stop listening after this many connections; @c 0 means never.
+     *
+     * The default is @c 1, and it is not a limit but the measurement.
+     * `s_server` says nothing about a handshake while it is running -
+     * with @c -www it prints @c ACCEPT and then nothing at all,
+     * whether the client completed the handshake, refused the
+     * certificate or never arrived. What it does print, on the way
+     * out, is its session statistics, and those answer the question
+     * exactly:
+     *
+     *     1 server accepts (SSL_accept())
+     *     1 server accepts that finished
+     *
+     * So the server is asked to serve one connection and leave. A test
+     * that needs it to stay up for several sets this higher and gets
+     * the totals for all of them; a test that sets it to @c 0 gets a
+     * server that never reports, and
+     * @ref TAPI_TLS_CLIENT_NONE whatever the client did.
+     */
+    unsigned int naccept;
 } tapi_tls_server_opt;
 
 /** Default: a self-signed certificate for @c localhost, serving a page. */
